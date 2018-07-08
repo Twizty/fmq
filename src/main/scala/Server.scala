@@ -14,6 +14,8 @@ import scala.collection._
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.{Lock, ReentrantReadWriteLock}
 
+import fs2.async.mutable.Signal
+
 
 object Example {
   def main(args: Array[String]): Unit = {
@@ -22,13 +24,11 @@ object Example {
     val s = new Server[IO](8765, 100, 1000, FiniteDuration(200, TimeUnit.SECONDS))
     Stream.eval(async.topic[IO, Subscription[IO]](Subscription[IO](null, Array(), "", 0))).flatMap { t =>
       Stream.eval(async.topic[IO, Event](DummyEvent)).flatMap { t2 =>
-        s.startServer(t, t2) {
-          case Request(body) => Some(body)
-          case Error(t) => {
-            println(t)
-            None
-          }
-        }.concurrently(t.subscribe(100).through(s.sinkSubscriptions(t2)).join(3)).drain
+        s.startServer(t, t2)
+         .concurrently(t.subscribe(100)
+         .through(s.sinkSubscriptions(t2))
+         .join(3))
+         .drain
       }
     }.compile.drain.unsafeRunSync()
 
@@ -85,20 +85,23 @@ class Server[F[_]](addr: Int,
   def sinkSubscriptions(topic: async.mutable.Topic[F, Event]): Pipe[F, Subscription[F], Stream[F, Either[Throwable, Unit]]] = {
     s =>
       s.filter(_.socket != null).map(s => {
-        topic.subscribe(100)
-          .filter(e => { println(e); e != DummyEvent })
-          .filter(_.time >= s.time)
-          .filter {
-            case MessageEvent(channel, _, _) => state.hostState(channel, s.addr).isDefined
-            case UnsubscribeEvent(host, _, _) => host == s.addr
-            case ExitEvent(host, _) => host == s.addr
-          }
-          .evalMap[Unit](handleEvent(_, s))
-          .attempt
+        Stream.eval(async.signalOf(false)).flatMap { sig =>
+          topic.subscribe(100)
+            .filter(_ != DummyEvent)
+            .filter(_.time >= s.time)
+            .filter {
+              case MessageEvent(channel, _, _) => state.hostState(channel, s.addr).isDefined
+              case UnsubscribeEvent(host, _, _) => host == s.addr
+              case ExitEvent(host, _) => host == s.addr
+            }
+            .evalMap[Unit](handleEvent(_, s, sig))
+            .attempt
+            .interruptWhen(sig)
+        }
       })
   }
 
-  def handleEvent(e: Event, s: Subscription[F]): F[Unit] = {
+  def handleEvent(e: Event, s: Subscription[F], signal: Signal[F, Boolean]): F[Unit] = {
     e match {
       case MessageEvent(channel, payload, _) =>
         state.hostState(channel, s.addr) match {
@@ -110,25 +113,30 @@ class Server[F[_]](addr: Int,
         s.socket.write(Chunk.bytes(s"unsubscribed from ${channels.mkString(", ")}".getBytes))
       case ExitEvent(_, _) =>
         state.deleteHost(s.addr)
-        F.flatMap(s.socket.write(Chunk.bytes("bye\n".getBytes)))(_ => s.socket.close)
+        F.flatMap(s.socket.write(Chunk.bytes("bye\n".getBytes))) { _ =>
+          F.flatMap(s.socket.close) { _ =>
+            signal.set(true)
+          }
+        }
     }
   }
 
-  def startServer(topic: async.mutable.Topic[F, Subscription[F]], eventTopic: async.mutable.Topic[F, Event])(handler: Handler): Stream[F, Unit] = {
+  def startServer(topic: async.mutable.Topic[F, Subscription[F]], eventTopic: async.mutable.Topic[F, Event]): Stream[F, Unit] = {
     val s = server(new InetSocketAddress(addr))
     s.map { x =>
       x.flatMap { socket =>
         eval(fs2.async.signalOf(false)).flatMap { initial =>
-          readWithTimeout[F](socket, readTimeouts, initial.get, readChunkSize)
+          socket.reads(readChunkSize, None)
             .through(parseBody)
             .attempt
             .evalMap {
               case Left(t) =>
-                respond(socket, handler(Error(t)))
+                println(t)
+                F.pure(())
               case Right(body) if endingsOfTheLine.find(body.startsWith(_)).isDefined =>
                 parseCommand(body.reverse.map(_.toChar).mkString) match {
                   case Some(Push(channel, data)) => publish(socket, eventTopic, channel, data)
-                  case Some(Subscribe(channels)) => subscribe(socket, topic, channels)
+                  case Some(Subscribe(channels)) => subscribe(initial, socket, topic, channels)
                   case Some(Unsubscribe(channels)) => unsubscribe(socket, eventTopic, channels)
                   case Some(Exit) => exit(socket, eventTopic)
                   case None => respond(socket, Some("invalid command\n".getBytes))
@@ -155,10 +163,18 @@ class Server[F[_]](addr: Int,
     }
   }
 
-  def subscribe(socket: Socket[F], topic: async.mutable.Topic[F, Subscription[F]], channels: Array[String]): F[Unit] = {
+  def subscribe(alreadySubscribed: async.mutable.Signal[F, Boolean], socket: Socket[F], topic: async.mutable.Topic[F, Subscription[F]], channels: Array[String]): F[Unit] = {
     F.flatMap(socket.remoteAddress) { a =>
       state.add(a.toString, channels)
-      topic.publish1(Subscription(socket, channels, a.toString, System.currentTimeMillis()))
+      F.flatMap(alreadySubscribed.get) { subscribed =>
+        if (subscribed) {
+          F.pure(())
+        } else {
+          F.flatMap(alreadySubscribed.set(true)) { _ =>
+            topic.publish1(Subscription(socket, channels, a.toString, System.currentTimeMillis()))
+          }
+        }
+      }
     }
   }
 
@@ -199,34 +215,6 @@ class Server[F[_]](addr: Int,
         }
       }}
     }
-
-  def readWithTimeout[F[_]](socket: Socket[F],
-                            timeout: FiniteDuration,
-                            shallTimeout: F[Boolean],
-                            chunkSize: Int
-                           )(implicit F: Effect[F]) : Stream[F, Byte] = {
-    def go(remains:FiniteDuration): Stream[F, Byte] = {
-      eval(shallTimeout).flatMap { shallTimeout =>
-        if (!shallTimeout) {
-          socket.reads(chunkSize, None)
-        } else {
-          if (remains <= 0.millis) {
-            Stream.raiseError(new TimeoutException())
-          } else {
-            eval(F.delay(System.currentTimeMillis())).flatMap { start =>
-              eval(socket.read(chunkSize, Some(remains))).flatMap { read =>
-                eval(F.delay(System.currentTimeMillis())).flatMap { end => read match {
-                  case Some(bytes) =>
-                    Stream.chunk(bytes) ++ go(remains - (end - start).millis)
-                  case None => Stream.empty
-                }}}}
-          }
-        }
-      }
-    }
-
-    go(timeout)
-  }
 }
 
 sealed trait SubscriptionState
