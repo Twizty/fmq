@@ -20,7 +20,6 @@ class EventSink[F[_]](state: State)(implicit F: Effect[F], ec: ExecutionContext)
           .evalMap[Unit](handleEvent(_, s, sig))
           .attempt
           .interruptWhen(sig)
-          .onFinalize(F.delay { state.deleteHost(s.addr) })
       }
     )
 

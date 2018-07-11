@@ -90,7 +90,7 @@ class Server[F[_]](addr: Int,
                   case None => respond(socket, Some("invalid command\n".getBytes))
                 }
               case Right(_) => F.pure(())
-            }.drain
+            }.drain.onFinalize(F.suspend { F.map(socket.remoteAddress) { addr => state.deleteHost(addr.toString) } })
         }
       }
     }.join(maxConcurrent)
