@@ -9,7 +9,6 @@ import fs2.io.tcp.{Socket, server}
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration._
-
 import fs2.async.mutable.Signal
 
 
@@ -90,7 +89,7 @@ class Server[F[_]](addr: Int,
                   case None => respond(socket, Some("invalid command\n".getBytes))
                 }
               case Right(_) => F.pure(())
-            }.drain.onFinalize(F.suspend { F.map(socket.remoteAddress) { addr => state.deleteHost(addr.toString) } })
+            }.drain.onFinalize(F.suspend { F.map(socket.remoteAddress)(addr => state deleteHost addr.toString)})
         }
       }
     }.join(maxConcurrent)
