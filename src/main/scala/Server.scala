@@ -3,7 +3,7 @@ import java.nio.channels.AsynchronousChannelGroup
 import java.util.concurrent.{Executors, TimeUnit}
 
 import cats.effect.{Effect, IO}
-import fs2.{Chunk, Pipe, Stream, async}
+import fs2.{Chunk, Pipe, Scheduler, Stream, async}
 import fs2.Stream.eval
 import fs2.io.tcp.{Socket, server}
 
@@ -17,15 +17,17 @@ object Example {
     implicit val group = AsynchronousChannelGroup.withThreadPool(Executors.newSingleThreadExecutor())
     implicit val ec = ExecutionContext.global
     val state = new State()
-    val s = new Server[IO](8765, 100, 1000, FiniteDuration(200, TimeUnit.SECONDS), state)
+    val s = new Server[IO](8765, 100, 1000, state)
     val sink = new EventSink[IO](state)
-    Stream.eval(async.topic[IO, Subscription[IO]](Subscription[IO](null, Array(), "", 0))).flatMap { t =>
-      Stream.eval(async.topic[IO, Event](DummyEvent)).flatMap { t2 =>
-        s.startServer(t, t2)
-         .concurrently(t.subscribe(100)
-         .through(sink.sinkSubscriptions(t2))
-         .join(100))
-         .drain
+    Scheduler[IO](4).flatMap { sch =>
+      Stream.eval(async.topic[IO, Subscription[IO]](Subscription[IO](null, Array(), "", 0))).flatMap { t =>
+        Stream.eval(async.topic[IO, Event](DummyEvent)).flatMap { t2 =>
+          s.startServer(t, t2, sch)
+            .concurrently(t.subscribe(100)
+              .through(sink.sinkSubscriptions(t2))
+              .join(100))
+            .drain
+        }
       }
     }.compile.drain.unsafeRunSync()
 
@@ -60,15 +62,17 @@ case class ExitEvent(host: String, time: Long) extends Event
 class Server[F[_]](addr: Int,
                    maxConcurrent: Int,
                    readChunkSize: Int,
-                   readTimeouts: FiniteDuration,
                    state: State)(
   implicit AG: AsynchronousChannelGroup,
   F: Effect[F],
   ec: ExecutionContext
 ) {
-  var endingsOfTheLine = Array(Array[Byte](10, 13))
+  val queueState = new QueueState[F]()
+  val endingsOfTheLine = Array(Array[Byte](10, 13))
 
-  def startServer(topic: async.mutable.Topic[F, Subscription[F]], eventTopic: async.mutable.Topic[F, Event]): Stream[F, Unit] = {
+  def startServer(topic: async.mutable.Topic[F, Subscription[F]],
+                  eventTopic: async.mutable.Topic[F, Event],
+                  scheduler: Scheduler): Stream[F, Unit] = {
     val s = server(new InetSocketAddress(addr))
     s.map { x =>
       x.flatMap { socket =>
@@ -80,11 +84,15 @@ class Server[F[_]](addr: Int,
               case Left(t) =>
                 println(t)
                 F.pure(())
+              case Right(body) if body == List(10, 13) =>
+                F.pure(())
               case Right(body) if endingsOfTheLine.find(body.startsWith(_)).isDefined =>
                 CommandParser.parse(body.reverse.map(_.toChar).mkString) match {
-                  case Some(Push(channel, data)) => publish(socket, eventTopic, channel, data)
+                  case Some(Publish(channel, data)) => publish(socket, eventTopic, channel, data)
                   case Some(Subscribe(channels)) => subscribe(initial, socket, topic, channels)
                   case Some(Unsubscribe(channels)) => unsubscribe(socket, eventTopic, channels)
+                  case Some(Push(queue, data)) => push(queue, data)
+                  case Some(Pull(queue, timeout)) => pull(socket, queue, timeout, scheduler)
                   case Some(Exit) => exit(socket, eventTopic)
                   case None => respond(socket, Some("invalid command\n".getBytes))
                 }
@@ -99,6 +107,28 @@ class Server[F[_]](addr: Int,
     resp match {
       case Some(d) => socket.write(Chunk.bytes(d))
       case None => F.pure()
+    }
+  }
+
+  def push(queue: String, data: String): F[Unit] = {
+    F.flatMap(queueState.get(queue)) { q =>
+      q.enqueue1(data)
+    }
+  }
+
+  def pull(socket: Socket[F], queue: String, timeout: Option[FiniteDuration], scheduler: Scheduler): F[Unit] = {
+    F.flatMap(queueState.get(queue)) { q =>
+      timeout match {
+        case Some(d) =>
+          F.flatMap(q.timedDequeue1(d, scheduler)) {
+            case Some(res) => socket.write(Chunk.bytes(("result: " + res).getBytes()))
+            case None => socket.write(Chunk.bytes("error: timeout".getBytes()))
+          }
+        case None =>
+          F.flatMap(q.dequeue1) { res =>
+            socket.write(Chunk.bytes(("result: " + res).getBytes()))
+          }
+      }
     }
   }
 

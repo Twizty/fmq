@@ -1,7 +1,3 @@
-import java.util.concurrent.locks.{Lock, ReentrantReadWriteLock}
-
-import scala.collection.Map
-
 sealed trait SubscriptionState
 case object Subscribed extends SubscriptionState
 case object Unsubscribed extends SubscriptionState
