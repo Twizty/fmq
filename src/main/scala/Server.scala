@@ -18,9 +18,9 @@ object Example {
     implicit val ec = ExecutionContext.global
     val state = new State()
     val s = new Server[IO](8765, 100, 1000, state)
-    val sink = new EventSink[IO](state)
+    val sink = new EventSink[IO]()
     Scheduler[IO](4).flatMap { sch =>
-      Stream.eval(async.topic[IO, Subscription[IO]](Subscription[IO](null, Array(), "", 0))).flatMap { t =>
+      Stream.eval(async.topic[IO, Subscription[IO]](Subscription[IO](null, Array(), "", null, 0))).flatMap { t =>
         Stream.eval(async.topic[IO, Event](DummyEvent)).flatMap { t2 =>
           s.startServer(t, t2, sch)
             .concurrently(t.subscribe(100)
@@ -47,7 +47,11 @@ object Example {
   }
 }
 
-case class Subscription[F[_]](socket: Socket[F], channels: Array[String], addr: String, time: Long)
+case class Subscription[F[_]](socket: Socket[F],
+                              channels: Array[String],
+                              addr: String,
+                              signal: Signal[F, Boolean],
+                              time: Long)
 
 sealed trait Event {
   def time: Long
@@ -55,7 +59,7 @@ sealed trait Event {
 case object DummyEvent extends Event {
   def time = 0l
 }
-case class MessageEvent(channel: String, payload: String, time: Long) extends Event
+case class MessageEvent(responders: Set[String], payload: String, time: Long) extends Event
 case class UnsubscribeEvent(host: String, channels: Array[String], time: Long) extends Event
 case class ExitEvent(host: String, time: Long) extends Event
 
@@ -76,28 +80,34 @@ class Server[F[_]](addr: Int,
     val s = server(new InetSocketAddress(addr))
     s.map { x =>
       x.flatMap { socket =>
-        eval(fs2.async.signalOf(false)).flatMap { initial =>
-          socket.reads(readChunkSize, None)
-            .through(parseBody)
-            .attempt
-            .evalMap {
-              case Left(t) =>
-                println(t)
-                F.pure(())
-              case Right(body) if body == List(10, 13) =>
-                F.pure(())
-              case Right(body) if endingsOfTheLine.find(body.startsWith(_)).isDefined =>
-                CommandParser.parse(body.reverse.map(_.toChar).mkString) match {
-                  case Some(Publish(channel, data)) => publish(socket, eventTopic, channel, data)
-                  case Some(Subscribe(channels)) => subscribe(initial, socket, topic, channels)
-                  case Some(Unsubscribe(channels)) => unsubscribe(socket, eventTopic, channels)
-                  case Some(Push(queue, data)) => push(queue, data)
-                  case Some(Pull(queue, timeout)) => pull(socket, queue, timeout, scheduler)
-                  case Some(Exit) => exit(socket, eventTopic)
-                  case None => respond(socket, Some("invalid command\n".getBytes))
-                }
-              case Right(_) => F.pure(())
-            }.drain.onFinalize(F.suspend { F.map(socket.remoteAddress)(addr => state deleteHost addr.toString)})
+        eval(socket.remoteAddress).flatMap { remoteAddr =>
+          eval(fs2.async.signalOf(false)).flatMap { initial =>
+            socket.reads(readChunkSize, None)
+              .through(parseBody)
+              .attempt
+              .evalMap {
+                case Left(t) =>
+                  println(t)
+                  F.pure(())
+                case Right(body) if body == List(10, 13) =>
+                  F.pure(())
+                case Right(body) if endingsOfTheLine.find(body.startsWith(_)).isDefined =>
+                  CommandParser.parse(body.reverse.map(_.toChar).mkString) match {
+                    case Some(Publish(channel, data)) => publish(socket, eventTopic, channel, data)
+                    case Some(Subscribe(channels)) => subscribe(initial, socket, topic, channels)
+                    case Some(Unsubscribe(channels)) => unsubscribe(socket, eventTopic, channels)
+                    case Some(Push(queue, data)) => push(queue, data)
+                    case Some(Pull(queue, timeout)) => pull(socket, queue, timeout, scheduler)
+                    case Some(Exit) => exit(socket, eventTopic)
+                    case None => respond(socket, Some("invalid command\n".getBytes))
+                  }
+                case Right(_) => F.pure(())
+              }.drain.onFinalize(
+                F.map(
+                  F.suspend(eventTopic.publish1(ExitEvent(remoteAddr.toString, System.currentTimeMillis())))
+                )(_ => F.delay { state deleteHost remoteAddr.toString })
+              )
+          }
         }
       }
     }.join(maxConcurrent)
@@ -133,10 +143,11 @@ class Server[F[_]](addr: Int,
   }
 
   def publish(socket: Socket[F], topic: async.mutable.Topic[F, Event], channel: String, data: String): F[Unit] ={
-    if (state.exchangeExists(channel)) {
-      topic.publish1(MessageEvent(channel, data, System.currentTimeMillis()))
-    } else {
-      socket.write(Chunk.bytes("no subscribers for given channel\n".getBytes))
+    state.get(channel) match {
+      case Some(set) if set.nonEmpty =>
+        topic.publish1(MessageEvent(set, data, System.currentTimeMillis()))
+      case _ =>
+        socket.write(Chunk.bytes("no subscribers for given channel\n".getBytes))
     }
   }
 
@@ -148,7 +159,11 @@ class Server[F[_]](addr: Int,
           F.pure(())
         } else {
           F.flatMap(alreadySubscribed.set(true)) { _ =>
-            topic.publish1(Subscription(socket, channels, a.toString, System.currentTimeMillis()))
+            F.flatMap(async.signalOf(false)) { sig =>
+              topic.publish1(
+                Subscription(socket, channels, a.toString, sig, System.currentTimeMillis())
+              )
+            }
           }
         }
       }
@@ -157,15 +172,19 @@ class Server[F[_]](addr: Int,
 
   def unsubscribe(socket: Socket[F], topic: async.mutable.Topic[F, Event], channels: Array[String]): F[Unit] = {
     F.flatMap(socket.remoteAddress) { a =>
-      state.unsubscribeExchanges(a.toString, channels)
+      state.deleteExchanges(a.toString, channels)
       topic.publish1(UnsubscribeEvent(a.toString, channels, System.currentTimeMillis()))
     }
   }
 
   def exit(socket: Socket[F], topic: async.mutable.Topic[F, Event]): F[Unit] = {
     F.flatMap(socket.remoteAddress) { a =>
-      state.unsubscribeHost(a.toString)
-      topic.publish1(ExitEvent(a.toString, System.currentTimeMillis()))
+      state.deleteHost(a.toString)
+      F.flatMap(socket.write(Chunk.bytes("bye\n".getBytes))) { _ =>
+        F.flatMap(topic.publish1(ExitEvent(a.toString, System.currentTimeMillis()))) { _ =>
+          socket.close
+        }
+      }
     }
   }
 

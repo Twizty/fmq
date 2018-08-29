@@ -1,74 +1,45 @@
-sealed trait SubscriptionState
-case object Subscribed extends SubscriptionState
-case object Unsubscribed extends SubscriptionState
-
 class State extends collection.convert.AsScalaConverters {
   import collection.concurrent
   import java.util.concurrent.ConcurrentHashMap
 
-  private val state: concurrent.Map[String, concurrent.Map[String, SubscriptionState]] =
-    mapAsScalaConcurrentMap(new ConcurrentHashMap[String, concurrent.Map[String, SubscriptionState]]())
+  private val state: concurrent.Map[String, Set[String]] =
+    mapAsScalaConcurrentMap(new ConcurrentHashMap[String, Set[String]]())
 
-  def newMap(k: String, v: SubscriptionState) = {
-    val m = mapAsScalaConcurrentMap(new ConcurrentHashMap[String, SubscriptionState]())
-    m.put(k, v)
-    m
-  }
-
-  def exchangeExists(exchange: String): Boolean =
-    state.get(exchange) match {
-      case Some(map) => map.exists { case (_, s) => s == Subscribed }
-      case None => false
-    }
-
-  def hostState(exchange: String, host: String): Option[SubscriptionState] =
-    state.get(exchange) match {
-      case Some(map) => map.get(host)
-      case None => None
-    }
+  def get(exchange: String): Option[Set[String]] =
+    state.get(exchange)
 
   def add(host: String, exchanges: Array[String]): Unit =
     exchanges.foreach { exchange =>
-      state.get(exchange) match {
-        case Some(s) => s.put(host, Subscribed)
-        case None =>
-          state.putIfAbsent(exchange, newMap(host, Subscribed)) match {
-            case Some(old) => old.put(host, Subscribed)
-            case None => ()
-          }
-      }
+      change(exchange, hosts => hosts + host)
     }
 
   def deleteExchanges(host: String, exchanges: Array[String]): Unit =
     exchanges.foreach { exchange =>
-      state.get(exchange) match {
-        case Some(s) => s.remove(host)
-        case None => ()
-      }
-    }
-
-  def unsubscribeExchanges(host: String, exchanges: Array[String]): Unit =
-    exchanges.foreach { exchange =>
-      state.get(exchange) match {
-        case Some(s) => s.update(host, Unsubscribed)
-        case None => ()
-      }
-    }
-
-  def unsubscribeHost(host: String): Unit =
-    state.keys.foreach { exchange =>
-      state.get(exchange) match {
-        case Some(s) => s.update(host, Unsubscribed)
-        case None => ()
-      }
+      change(exchange, hosts => hosts - host)
     }
 
   def deleteHost(host: String): Unit =
     state.keys.foreach { exchange =>
-      state.get(exchange) match {
-        case Some(s) => s.remove(host)
-        case None => ()
-      }
+      change(exchange, hosts => hosts - host)
     }
+
+  private def change(k: String, callback: Set[String] => Set[String]): Unit =
+    state.get(k) match {
+      case Some(value) =>
+        replace(k, value, callback)
+      case None =>
+        state.putIfAbsent(k, callback(Set.empty)) match {
+          case Some(value) => replace(k, value, callback)
+          case None => ()
+        }
+    }
+
+  def replace(k: String, value: Set[String], callback: Set[String] => Set[String]): Unit = {
+    if (state.replace(k, value, callback(value))) {
+      ()
+    } else {
+      change(k, callback)
+    }
+  }
 }
 
