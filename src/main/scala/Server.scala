@@ -2,55 +2,50 @@ import java.net.InetSocketAddress
 import java.nio.channels.AsynchronousChannelGroup
 import java.util.concurrent.{Executors, TimeUnit}
 
-import cats.effect.{Effect, IO}
-import fs2.{Chunk, Pipe, Scheduler, Stream, async}
+import cats.effect._
+import cats.effect.concurrent._
+import cats.effect.implicits._
+import cats.syntax.all._
+import fs2.{Chunk, Pipe, Stream}
+import fs2.{concurrent => async}
 import fs2.Stream.eval
 import fs2.io.tcp.{Socket, server}
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration._
-import fs2.async.mutable.Signal
+import fs2.concurrent.{Queue, Signal}
 
 
-object Example {
-  def main(args: Array[String]): Unit = {
+object Example extends IOApp {
+  def run(args: List[String]): IO[ExitCode] = {
+
     implicit val group = AsynchronousChannelGroup.withThreadPool(Executors.newSingleThreadExecutor())
     implicit val ec = ExecutionContext.global
+    implicit val contextShift: ContextShift[IO] = IO.contextShift(ec)
     val state = new State()
-    val s = new Server[IO](8765, 100, 1000, state)
     val sink = new EventSink[IO]()
-    Scheduler[IO](4).flatMap { sch =>
-      Stream.eval(async.topic[IO, Subscription[IO]](Subscription[IO](null, Array(), "", null, 0))).flatMap { t =>
-        Stream.eval(async.topic[IO, Event](DummyEvent)).flatMap { t2 =>
-          s.startServer(t, t2, sch)
-            .concurrently(t.subscribe(100)
-              .through(sink.sinkSubscriptions(t2))
-              .join(100))
-            .drain
+
+    Stream.eval(async.Topic[IO, Subscription[IO]](Subscription[IO](null, Array(), "", null, 0))).flatMap { t =>
+      Stream.eval(async.Topic[IO, Event](DummyEvent)).flatMap { t2 =>
+        Stream.eval(MVar.of[IO, Map[String, Set[String]]](Map.empty[String, Set[String]])).flatMap { mvar1 =>
+          Stream.eval(MVar.of[IO, Map[String, UnboundedTimedQueue[IO, String]]](Map.empty[String, UnboundedTimedQueue[IO, String]])).flatMap { mvar2 =>
+            val s = new Server[IO](8765, 100, 1000, mvar1, mvar2)
+            s.startServer(t, t2)
+              .concurrently(t.subscribe(100)
+                .through(sink.sinkSubscriptions(t2))
+                .parJoin(100))
+              .drain
+          }
         }
       }
-    }.compile.drain.unsafeRunSync()
-
-    //    val sch = Scheduler[IO](4)
-    //
-    //    sch.flatMap { sc =>
-    //      println(System.currentTimeMillis)
-    //      sc.delay(Stream.eval(IO {
-    //        Left("exception"): Either[String, Long]
-    //      }), 2.second)
-    //    }.merge(Stream.eval(IO {
-    //      Thread.sleep(1500); Right(System.currentTimeMillis): Either[String, Long]
-    //    })).head.map {
-    //      case Left(ex) => println("boom!! " + ex)
-    //      case Right(v) => println(v)
-    //    }.compile.toList.unsafeRunSync()
+    }.compile.drain.as(ExitCode.Success)
   }
 }
 
 case class Subscription[F[_]](socket: Socket[F],
                               channels: Array[String],
                               addr: String,
-                              signal: Signal[F, Boolean],
+                              signal: async.SignallingRef[F, Boolean],
                               time: Long)
 
 sealed trait Event {
@@ -66,22 +61,26 @@ case class ExitEvent(host: String, time: Long) extends Event
 class Server[F[_]](addr: Int,
                    maxConcurrent: Int,
                    readChunkSize: Int,
-                   state: State)(
+                   state: MVar[F, Map[String, Set[String]]],
+                   qState: MVar[F, Map[String, UnboundedTimedQueue[F, String]]])(
   implicit AG: AsynchronousChannelGroup,
   F: Effect[F],
+  C: Concurrent[F],
+  T: Timer[F],
+  CF: ConcurrentEffect[F],
   ec: ExecutionContext
 ) {
-  val queueState = new QueueState[F]()
+  val queueState = new QueueState[F](qState)
   val endingsOfTheLine = Array(Array[Byte](10, 13))
+  val functionalState = new FunctionalState[F](state)
 
-  def startServer(topic: async.mutable.Topic[F, Subscription[F]],
-                  eventTopic: async.mutable.Topic[F, Event],
-                  scheduler: Scheduler): Stream[F, Unit] = {
+  def startServer(topic: async.Topic[F, Subscription[F]],
+                  eventTopic: async.Topic[F, Event]): Stream[F, Unit] = {
     val s = server(new InetSocketAddress(addr))
-    s.map { x =>
-      x.flatMap { socket =>
-        eval(socket.remoteAddress).flatMap { remoteAddr =>
-          eval(fs2.async.signalOf(false)).flatMap { initial =>
+    s.map[Stream[F, Unit]] { r =>
+      eval(r.use { socket =>
+        socket.remoteAddress.flatMap { remoteAddr =>
+          async.SignallingRef(false).flatMap { initial =>
             socket.reads(readChunkSize, None)
               .through(parseBody)
               .attempt
@@ -97,20 +96,20 @@ class Server[F[_]](addr: Int,
                     case Some(Subscribe(channels)) => subscribe(initial, socket, topic, channels)
                     case Some(Unsubscribe(channels)) => unsubscribe(socket, eventTopic, channels)
                     case Some(Push(queue, data)) => push(queue, data)
-                    case Some(Pull(queue, timeout)) => pull(socket, queue, timeout, scheduler)
+                    case Some(Pull(queue, timeout)) => pull(socket, queue, timeout)
                     case Some(Exit) => exit(socket, eventTopic)
                     case None => respond(socket, Some("invalid command\n".getBytes))
                   }
                 case Right(_) => F.pure(())
-              }.drain.onFinalize(
-                F.map(
-                  F.suspend(eventTopic.publish1(ExitEvent(remoteAddr.toString, System.currentTimeMillis())))
-                )(_ => F.delay { state deleteHost remoteAddr.toString })
-              )
+              }.onFinalize(
+                eventTopic.publish1(ExitEvent(remoteAddr.toString, System.currentTimeMillis())).flatMap { _ =>
+                  functionalState deleteHost remoteAddr.toString
+                }
+              ).compile.drain
           }
         }
-      }
-    }.join(maxConcurrent)
+      })
+    }.parJoin(maxConcurrent)
   }
 
   def respond(socket: Socket[F], resp: Option[Array[Byte]]): F[Unit] = {
@@ -126,11 +125,11 @@ class Server[F[_]](addr: Int,
     }
   }
 
-  def pull(socket: Socket[F], queue: String, timeout: Option[FiniteDuration], scheduler: Scheduler): F[Unit] = {
+  def pull(socket: Socket[F], queue: String, timeout: Option[FiniteDuration]): F[Unit] = {
     F.flatMap(queueState.get(queue)) { q =>
       timeout match {
         case Some(d) =>
-          F.flatMap(q.timedDequeue1(d, scheduler)) {
+          F.flatMap(q.timedDequeue1(d)) {
             case Some(res) => socket.write(Chunk.bytes(("result: " + res).getBytes()))
             case None => socket.write(Chunk.bytes("error: timeout".getBytes()))
           }
@@ -142,8 +141,8 @@ class Server[F[_]](addr: Int,
     }
   }
 
-  def publish(socket: Socket[F], topic: async.mutable.Topic[F, Event], channel: String, data: String): F[Unit] ={
-    state.get(channel) match {
+  def publish(socket: Socket[F], topic: async.Topic[F, Event], channel: String, data: String): F[Unit] ={
+    F.flatMap(functionalState.get(channel)) {
       case Some(set) if set.nonEmpty =>
         topic.publish1(MessageEvent(set, data, System.currentTimeMillis()))
       case _ =>
@@ -151,18 +150,19 @@ class Server[F[_]](addr: Int,
     }
   }
 
-  def subscribe(alreadySubscribed: async.mutable.Signal[F, Boolean], socket: Socket[F], topic: async.mutable.Topic[F, Subscription[F]], channels: Array[String]): F[Unit] = {
+  def subscribe(alreadySubscribed: async.SignallingRef[F, Boolean], socket: Socket[F], topic: async.Topic[F, Subscription[F]], channels: Array[String]): F[Unit] = {
     F.flatMap(socket.remoteAddress) { a =>
-      state.add(a.toString, channels)
-      F.flatMap(alreadySubscribed.get) { subscribed =>
-        if (subscribed) {
-          F.pure(())
-        } else {
-          F.flatMap(alreadySubscribed.set(true)) { _ =>
-            F.flatMap(async.signalOf(false)) { sig =>
-              topic.publish1(
-                Subscription(socket, channels, a.toString, sig, System.currentTimeMillis())
-              )
+      F.flatMap(functionalState.add(a.toString, channels)) { _ =>
+        F.flatMap(alreadySubscribed.get) { subscribed =>
+          if (subscribed) {
+            F.pure(())
+          } else {
+            F.flatMap(alreadySubscribed.set(true)) { _ =>
+              F.flatMap(async.SignallingRef(false)) { sig =>
+                topic.publish1(
+                  Subscription(socket, channels, a.toString, sig, System.currentTimeMillis())
+                )
+              }
             }
           }
         }
@@ -170,19 +170,21 @@ class Server[F[_]](addr: Int,
     }
   }
 
-  def unsubscribe(socket: Socket[F], topic: async.mutable.Topic[F, Event], channels: Array[String]): F[Unit] = {
+  def unsubscribe(socket: Socket[F], topic: async.Topic[F, Event], channels: Array[String]): F[Unit] = {
     F.flatMap(socket.remoteAddress) { a =>
-      state.deleteExchanges(a.toString, channels)
-      topic.publish1(UnsubscribeEvent(a.toString, channels, System.currentTimeMillis()))
+      F.flatMap(functionalState.deleteExchanges(a.toString, channels)) { _ =>
+        topic.publish1(UnsubscribeEvent(a.toString, channels, System.currentTimeMillis()))
+      }
     }
   }
 
-  def exit(socket: Socket[F], topic: async.mutable.Topic[F, Event]): F[Unit] = {
+  def exit(socket: Socket[F], topic: async.Topic[F, Event]): F[Unit] = {
     F.flatMap(socket.remoteAddress) { a =>
-      state.deleteHost(a.toString)
-      F.flatMap(socket.write(Chunk.bytes("bye\n".getBytes))) { _ =>
-        F.flatMap(topic.publish1(ExitEvent(a.toString, System.currentTimeMillis()))) { _ =>
-          socket.close
+      F.flatMap(functionalState.deleteHost(a.toString)) { _ =>
+        F.flatMap(socket.write(Chunk.bytes("bye\n".getBytes))) { _ =>
+          F.flatMap(topic.publish1(ExitEvent(a.toString, System.currentTimeMillis()))) { _ =>
+            socket.close
+          }
         }
       }
     }

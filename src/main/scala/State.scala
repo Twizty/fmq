@@ -34,7 +34,7 @@ class State extends collection.convert.AsScalaConverters {
         }
     }
 
-  def replace(k: String, value: Set[String], callback: Set[String] => Set[String]): Unit = {
+  private def replace(k: String, value: Set[String], callback: Set[String] => Set[String]): Unit = {
     if (state.replace(k, value, callback(value))) {
       ()
     } else {
