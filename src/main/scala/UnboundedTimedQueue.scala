@@ -33,8 +33,8 @@ class UnboundedTimedQueue[F[_], A](qref: Ref[F, QState[F, A]])(
   protected def sizeChanged(s: QState[F, A], ns: QState[F, A]): F[Unit] = F.unit
 
   def enqueue1(a: A): F[Unit] = offer1(a).void
-  def timedEnqueue1(a: A, finiteDuration: FiniteDuration)(implicit T: Timer[F]): F[Unit] =
-    offer1(a).void
+  def timedEnqueue1(a: A, finiteDuration: FiniteDuration)(implicit T: Timer[F]): F[Boolean] =
+    offer1(a).as(true)
 
   def offer1(a: A): F[Boolean] =
     qref
