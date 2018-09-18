@@ -60,7 +60,7 @@ class UnboundedTimedQueue[F[_], A](qref: Ref[F, QState[F, A]])(
       .as(true)
 
   def dequeue1: F[A] = dequeueBatch1(1).map(_.head.get)
-  def timedDequeue1(duration: FiniteDuration)(implicit T: Timer[F]): F[Option[A]] = timedDequeueBatch1(1, duration).map(_.head)
+  def timedDequeue1(duration: FiniteDuration)(implicit T: Timer[F]): F[Option[A]] = timedDequeueBatch1(1, duration).map(_.map(_.head.get))
 
   def dequeue: Stream[F, A] =
     Stream
@@ -80,7 +80,7 @@ class UnboundedTimedQueue[F[_], A](qref: Ref[F, QState[F, A]])(
   def dequeueBatch1(batchSize: Int): F[Chunk[A]] =
     dequeueBatch1Impl(batchSize, new Token, (d, _) => d.get)
 
-  def timedDequeueBatch1(batchSize: Int, duration: FiniteDuration)(implicit T: Timer[F]): F[Chunk[A]] = {
+  def timedDequeueBatch1(batchSize: Int, duration: FiniteDuration)(implicit T: Timer[F]): F[Option[Chunk[A]]] = {
     val getter: Getter = (d, cleanup) =>
       F.flatMap(F.race(T.sleep(duration), d.get)) {
         case Left(_) =>
@@ -90,7 +90,8 @@ class UnboundedTimedQueue[F[_], A](qref: Ref[F, QState[F, A]])(
           }
         case Right(v) => v.pure[F]
       }
-    dequeueBatch1Impl(batchSize, new Token, getter)
+
+    dequeueBatch1Impl(batchSize, new Token, getter).map(c => if (c.isEmpty) None else Some(c))
   }
 
   private def dequeueBatch1Impl(batchSize: Int, token: Token, getter: Getter): F[Chunk[A]] =
