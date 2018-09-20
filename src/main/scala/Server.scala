@@ -28,7 +28,7 @@ object Example extends IOApp {
     Stream.eval(async.Topic[IO, Subscription[IO]](Subscription[IO](null, Array(), "", null, 0))).flatMap { t =>
       Stream.eval(async.Topic[IO, Event](DummyEvent)).flatMap { t2 =>
         Stream.eval(MVar.of[IO, Map[String, Set[String]]](Map.empty[String, Set[String]])).flatMap { mvar1 =>
-          Stream.eval(MVar.of[IO, Map[String, UnboundedTimedQueue[IO, String]]](Map.empty[String, UnboundedTimedQueue[IO, String]])).flatMap { mvar2 =>
+          Stream.eval(MVar.of[IO, Map[String, Queue[IO, String]]](Map.empty[String, Queue[IO, String]])).flatMap { mvar2 =>
             val s = new Server[IO](8765, 100, 1000, mvar1, mvar2)
             s.startServer(t, t2)
               .concurrently(t.subscribe(100)
@@ -62,7 +62,7 @@ class Server[F[_]](addr: Int,
                    maxConcurrent: Int,
                    readChunkSize: Int,
                    state: MVar[F, Map[String, Set[String]]],
-                   qState: MVar[F, Map[String, UnboundedTimedQueue[F, String]]])(
+                   qState: MVar[F, Map[String, Queue[F, String]]])(
   implicit AG: AsynchronousChannelGroup,
   F: Effect[F],
   C: Concurrent[F],
@@ -129,9 +129,9 @@ class Server[F[_]](addr: Int,
     F.flatMap(queueState.get(queue)) { q =>
       timeout match {
         case Some(d) =>
-          F.flatMap(q.timedDequeue1(d)) {
-            case Some(res) => socket.write(Chunk.bytes(("result: " + res).getBytes()))
-            case None => socket.write(Chunk.bytes("error: timeout".getBytes()))
+          F.flatMap(Concurrent.timeout(q.dequeue1, d).attempt) {
+            case Right(res) => socket.write(Chunk.bytes(("result: " + res).getBytes()))
+            case Left(_) => socket.write(Chunk.bytes("error: timeout".getBytes()))
           }
         case None =>
           F.flatMap(q.dequeue1) { res =>
