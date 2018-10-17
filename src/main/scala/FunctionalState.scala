@@ -1,11 +1,11 @@
 import cats.effect.Concurrent
-import cats.effect.concurrent.MVar
+import cats.effect.concurrent.Ref
 
-class FunctionalState[F[_]](state: MVar[F, Map[String, Set[String]]])(implicit F: Concurrent[F]) {
+class FunctionalState[F[_]](state: Ref[F, Map[String, Set[String]]])(implicit F: Concurrent[F]) {
   type State = Map[String, Set[String]]
 
   def get(exchange: String): F[Option[Set[String]]] =
-    F.map(state.read) { map =>
+    F.map(state.get) { map =>
       map.get(exchange)
     }
 
@@ -40,7 +40,7 @@ class FunctionalState[F[_]](state: MVar[F, Map[String, Set[String]]])(implicit F
     }
 
   private def change(f: State => State): F[Unit] =
-    F.flatMap(state.take) { map =>
-      state.put(f(map))
+    state.modify { map =>
+      (f(map), ())
     }
 }

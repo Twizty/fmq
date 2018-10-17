@@ -27,8 +27,8 @@ object Example extends IOApp {
 
     Stream.eval(async.Topic[IO, Subscription[IO]](Subscription[IO](null, Array(), "", null, 0))).flatMap { t =>
       Stream.eval(async.Topic[IO, Event](DummyEvent)).flatMap { t2 =>
-        Stream.eval(MVar.of[IO, Map[String, Set[String]]](Map.empty[String, Set[String]])).flatMap { mvar1 =>
-          Stream.eval(MVar.of[IO, Map[String, Queue[IO, String]]](Map.empty[String, Queue[IO, String]])).flatMap { mvar2 =>
+        Stream.eval(Ref.of[IO, Map[String, Set[String]]](Map.empty[String, Set[String]])).flatMap { mvar1 =>
+          Stream.eval(Ref.of[IO, Map[String, Queue[IO, String]]](Map.empty[String, Queue[IO, String]])).flatMap { mvar2 =>
             val s = new Server[IO](8765, 100, 1000, mvar1, mvar2)
             s.startServer(t, t2)
               .concurrently(t.subscribe(100)
@@ -61,8 +61,8 @@ case class ExitEvent(host: String, time: Long) extends Event
 class Server[F[_]](addr: Int,
                    maxConcurrent: Int,
                    readChunkSize: Int,
-                   state: MVar[F, Map[String, Set[String]]],
-                   qState: MVar[F, Map[String, Queue[F, String]]])(
+                   state: Ref[F, Map[String, Set[String]]],
+                   qState: Ref[F, Map[String, Queue[F, String]]])(
   implicit AG: AsynchronousChannelGroup,
   F: Effect[F],
   C: Concurrent[F],
