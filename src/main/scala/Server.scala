@@ -22,7 +22,6 @@ object Example extends IOApp {
     implicit val group = AsynchronousChannelGroup.withThreadPool(Executors.newSingleThreadExecutor())
     implicit val ec = ExecutionContext.global
     implicit val contextShift: ContextShift[IO] = IO.contextShift(ec)
-    val state = new State()
     val sink = new EventSink[IO]()
 
     Stream.eval(async.Topic[IO, Subscription[IO]](Subscription[IO](null, Array(), "", null, 0))).flatMap { t =>
